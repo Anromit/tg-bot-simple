@@ -1,113 +1,75 @@
-"""
-db.py — слой данных для DailyZodiakBot.
-
-Таблица users:
-  - user_id (PK)             — Telegram user id
-  - sign                     — знак зодиака (строка из списка)
-  - notify_hour INTEGER      — час суток (0..23), когда слать сообщение
-  - subscribed INTEGER       — 1/0 — подписка включена/выключена
-  - last_sent_date TEXT      — 'YYYY-MM-DD', чтобы не слать повторно за день
-
-Приёмы:
-  - отдельное подключение под каждую операцию (with _connect());
-  - PRAGMA: WAL + busy_timeout + row_factory=Row (см. Л3) [oai_citation:5‡L3.pdf](file-service://file-TzQZFVK22mksuAGPBby5ME);
-  - все SQL — параметризованные через "?" (никаких f-строк).
-"""
-
-from __future__ import annotations
+import os
 import sqlite3
-import logging
-from typing import Optional
 
-from config3 import DB_PATH, DEFAULT_NOTIFY_HOUR
-
-log = logging.getLogger(__name__)
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 
-# ---------- подключение с «правильными» PRAGMA (см. Л3) ----------
-def _connect() -> sqlite3.Connection:
+def _connect():
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
-# WAL + busy_timeout уменьшают «database is locked», row_factory даёт доступ к полям по имени [oai_citation:6‡L3.pdf](file-service://file-TzQZFVK22mksuAGPBby5ME)
 
 
-# ---------- инициализация схемы ----------
-def init_db() -> None:
-    """
-    Создаёт таблицу users, если её нет.
-    Простейшие разумные дефолты; CHECK-ограничения оставим на стороне логики.
-    """
+def init_db():
     schema = """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id        INTEGER PRIMARY KEY,
-        sign           TEXT,
-        notify_hour    INTEGER NOT NULL DEFAULT 9,
-        subscribed     INTEGER NOT NULL DEFAULT 1,
-        last_sent_date TEXT
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE INDEX IF NOT EXISTS idx_users_hour ON users(notify_hour);
-    CREATE INDEX IF NOT EXISTS idx_users_sent ON users(last_sent_date);
+    CREATE INDEX IF NOT EXISTS idx_user_id ON notes(user_id);
+    CREATE INDEX IF NOT EXISTS idx_created_at ON notes(created_at);
+
+    CREATE TABLE IF NOT EXISTS models (
+        id INTEGER PRIMARY KEY,
+        key TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_models_single_active ON models(active) WHERE active=1;
+
+    INSERT OR IGNORE INTO models(id, key, label, active) VALUES
+        (1, 'inception/mercury', 'Inception: Mercury', 1),
+        (2, 'google/gemini-2.5-flash-lite-preview-06-17', 'google/gemini-2.5-flash-lite-preview-06-17', 0),
+        (3, 'mistralai/mistral-small-24b-instruct-2501:free', 'Mistral Small 24b (free)', 0),
+        (4, 'meta-llama/llama-3.1-8b-instruct:free', 'Llama 3.1 8B (free)', 0);
+
     """
     with _connect() as conn:
         conn.executescript(schema)
-    log.info("DB initialized: %s", DB_PATH)
 
 
-# ---------- upsert/получение пользователя ----------
-def ensure_user(user_id: int) -> None:
-    """Гарантируем наличие строки пользователя с дефолтами."""
+def list_models() -> list[dict]:
     with _connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users(user_id, notify_hour, subscribed) VALUES (?, ?, 1)",
-            (user_id, DEFAULT_NOTIFY_HOUR)
-        )
+        rows = conn.execute("SELECT id,key,label,active FROM models ORDER BY id").fetchall()
+        return [{"id": r["id"], "key": r["key"], "label": r["label"], "active": bool(r["active"])} for r in rows]
 
-def get_user(user_id: int) -> Optional[sqlite3.Row]:
+
+def get_active_model() -> dict:
     with _connect() as conn:
-        cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cur.fetchone()
+        row = conn.execute("SELECT id,key,label FROM models WHERE active=1").fetchone()
+        if row:
+            return {"id": row["id"], "key": row["key"], "label": row["label"], "active": True}
+        row = conn.execute("SELECT id,key,label FROM models ORDER BY id LIMIT 1").fetchone()
+        if not row:
+            raise RuntimeError("В реестре моделей нет записей")
+        conn.execute("UPDATE models SET active=CASE WHEN id=? THEN 1 ELSE 0 END", (row["id"],))
+        return {"id": row["id"], "key": row["key"], "label": row["label"], "active": True}
 
 
-# ---------- настройки профиля ----------
-def set_sign(user_id: int, sign: str) -> None:
+def set_active_model(model_id: int) -> dict:
     with _connect() as conn:
-        conn.execute("UPDATE users SET sign = ? WHERE user_id = ?", (sign, user_id))
-
-def set_notify_hour(user_id: int, hour: int) -> None:
-    hour = max(0, min(int(hour), 23))
-    with _connect() as conn:
-        conn.execute("UPDATE users SET notify_hour = ? WHERE user_id = ?", (hour, user_id))
-
-def set_subscribed(user_id: int, on: bool) -> None:
-    val = 1 if on else 0
-    with _connect() as conn:
-        conn.execute("UPDATE users SET subscribed = ? WHERE user_id = ?", (val, user_id))
-
-
-# ---------- рассылка: выборка и отметка отправки ----------
-def list_due_users(today_str: str, hour: int) -> list[sqlite3.Row]:
-    """
-    Вернёт пользователей, кому надо отправить: подписан, час совпал, ещё не отправляли сегодня, знак задан.
-    """
-    with _connect() as conn:
-        cur = conn.execute(
-            """
-            SELECT user_id, sign
-            FROM users
-            WHERE subscribed = 1
-              AND sign IS NOT NULL
-              AND notify_hour = ?
-              AND (last_sent_date IS NULL OR last_sent_date <> ?)
-            """,
-            (hour, today_str)
-        )
-        return cur.fetchall()
-
-def mark_sent_today(user_id: int, today_str: str) -> None:
-    with _connect() as conn:
-        conn.execute("UPDATE users SET last_sent_date = ? WHERE user_id = ?", (today_str, user_id))
+        conn.execute("BEGIN IMMEDIATE")
+        exists = conn.execute("SELECT 1 FRO models WHERE id=?", (model_id,)).fetchone()
+        if not exists:
+            conn.rollback()
+            raise ValueError("Неизвестный ID модели")
+        conn.execute("UPDATE models SET active=CASE WHEN id=? THEN 1 ELSE 0 END", (model_id,))
+        conn.commit()
+    return get_active_model()

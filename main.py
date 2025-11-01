@@ -6,13 +6,17 @@ from typing import List
 import logging
 import requests
 
+# Настройка прокси (раскомментируйте если нужно)
+# from telebot import apihelper
+# apihelper.proxy = {'https': 'socks5://user:pass@host:port'}
+
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 
 if not TOKEN:
- raise RuntimeError("В .env нет TOKEN")
-bot = telebot.TeleBot(TOKEN)
+    raise RuntimeError("В .env нет TOKEN")
 
+bot = telebot.TeleBot(TOKEN)
 def parse_ints_from_text(text: str) -> List[int]:
     """Выделяет из текста целые числа: нормализует запятые, игнорирует токены-команды."""
     text = text.replace(",", " ")
@@ -199,5 +203,11 @@ def make_main_kb()->types.ReplyKeyboardMarkup:
     
  
 if __name__ == "__main__":
- bot.infinity_polling(skip_pending=True)
+    import time
+    while True:
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print("Ошибка polling")
+            time.sleep(5)
 
