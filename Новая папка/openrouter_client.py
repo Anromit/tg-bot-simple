@@ -9,12 +9,15 @@ load_dotenv()
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+
 @dataclass
 class OpenRouterError(Exception):
     status: int
     msg: str
+    
     def __str__(self) -> str:
         return f"[{self.status}] {self.msg}"
+
 
 def _friendly(status: int) -> str:
     return {
@@ -23,11 +26,12 @@ def _friendly(status: int) -> str:
         403: "Нет прав доступа к модели.",
         404: "Эндпоинт не найден. Проверьте URL /api/v1/chat/completions.",
         429: "Превышены лимиты бесплатной модели. Попробуйте позднее.",
-        500: "Внутренняя ошибка сервера. Попробуйте позднее.",
-        502: "Сервер модели временно недоступен (Bad Gateway). Попробуйте позднее.",
-        503: "Сервис временно перегружен (Service Unavailable). Попробуйте позднее.",
-        504: "Сервер модели не отвечает (Gateway Timeout). Попробуйте позднее.",
+        500: "Внутренняя ошибка сервера OpenRouter. Повторите попытку позже.",
+        502: "Проблема с соединением между серверами OpenRouter. Повторите попытку позже.",
+        503: "Сервис OpenRouter временно недоступен. Повторите попытку позже.",
+        504: "Таймаут шлюза OpenRouter. Сервер не ответил вовремя. Повторите попытку позже.",
     }.get(status, "Сервис недоступен. Повторите попытку позже.")
+
 
 def chat_once(messages: List[Dict], *,
               model: str,
@@ -36,30 +40,36 @@ def chat_once(messages: List[Dict], *,
               timeout_s: int = 30) -> Tuple[str, int]:
     if not OPENROUTER_API_KEY:
         raise OpenRouterError(401, "Отсутствует OPENROUTER_API_KEY (.env).")
-
+    
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-
+    
     payload = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-
+    
     t0 = time.perf_counter()
-    r = requests.post(OPENROUTER_API, json=payload, headers=headers, timeout=timeout_s)
-    dt_ms = int((time.perf_counter() - t0) * 1000)
-
-    if r.status_code // 100 != 2:
-        raise OpenRouterError(r.status_code, _friendly(r.status_code))
-
     try:
-        data = r.json()
-        text = data["choices"][0]["message"]["content"]
-    except Exception:
-        raise OpenRouterError(500, "Неожиданная структура ответа OpenRouter.")
-
-    return text, dt_ms
+        r = requests.post(OPENROUTER_API, json=payload, headers=headers, timeout=timeout_s)
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        
+        if r.status_code // 100 != 2:
+            raise OpenRouterError(r.status_code, _friendly(r.status_code))
+        
+        try:
+            data = r.json()
+            text = data["choices"][0]["message"]["content"]
+        except Exception:
+            raise OpenRouterError(500, "Неожиданная структура ответа OpenRouter.")
+        
+        return text, dt_ms
+        
+    except requests.exceptions.Timeout:
+        raise OpenRouterError(408, f"Таймаут запроса ({timeout_s}с). Проверьте соединение.")
+    except requests.exceptions.ConnectionError:
+        raise OpenRouterError(503, "Ошибка подключения к OpenRouter. Проверьте интернет-соединение.")
