@@ -1,213 +1,555 @@
 import os
+from random import random
+
 from dotenv import load_dotenv
 import telebot
+import time
+from datetime import datetime, timedelta
+
 from telebot import types
-from typing import List
-import logging
-import requests
 
-# Настройка прокси (раскомментируйте если нужно)
-# from telebot import apihelper
-# apihelper.proxy = {'https': 'socks5://user:pass@host:port'}
+from db import init_db, add_note, list_notes, update_note, delete_note, find_notes, list_models, get_active_model, \
+    set_active_model, list_characters, get_character_by_id, get_user_character, set_user_character, get_model_by_id
+from openrouter_client import chat_once, OpenRouterError
 
+# Загрузка переменных окружения
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
-
 if not TOKEN:
-    raise RuntimeError("В .env нет TOKEN")
+    raise RuntimeError("В .env файле нет TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
-def parse_ints_from_text(text: str) -> List[int]:
-    """Выделяет из текста целые числа: нормализует запятые, игнорирует токены-команды."""
-    text = text.replace(",", " ")
-    tokens = [tok for tok in text.split() if not tok.startswith("/")]
-    return [int(tok) for tok in tokens if is_int_token(tok)]
 
-def is_int_token(t: str) -> bool:
-    """Проверка токена на целое число (с поддержкой знака минус)."""
-    if not t:
-        return False
-    t = t.strip()
-    if t in {"-", ""}:
-        return False
-    return t.lstrip("-").isdigit()
+# Инициализация базы данных при запуске
+init_db()
 
-
-
-
-def fetch_weather_moscow_open_meteo() -> str:
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": 55.7558,
-        "longitude": 37.6173,
-        "current": "temperature_2m",
-        "timezone": "Europe/Moscow"
-    }
-    try:
-        r = requests.get(url, params=params, timeout=5)
-        r.raise_for_status()
-        t = r.json()["current"]["temperature_2m"]
-        return f"Москва: сейчас {round(t)}°C"
-    except Exception:
-        return "Не удалось получить погоду."
-        
-        
-@bot.message_handler(func=lambda m: m.text == "Weather")
-def  Weather(message):
-    
- bot.reply_to(message, fetch_weather_moscow_open_meteo())
-        
-        
-
-
-
-
-
-
-@bot.message_handler(commands=["start", "help"])
-def start_help(m: types.Message) -> None:
-    bot.send_message(
-        m.chat.id,
-        "Привет! Доступно: /about, /confirm, /ping, /hide, /show \n"
-        "Или воспользуйтесь кнопками ниже.",
-        reply_markup=make_main_kb()
-    )
+# Константы
+MAX_NOTES_PER_USER = 50
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
- bot.reply_to(message, "Привет! Я твой первый бот! Напиши /help")
- 
- 
- 
+    bot.reply_to(message, "Привет! Я бот для заметок. Используй /help для списка команд.")
+
+
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
- bot.reply_to(message, "/start - начать\n/help - помощь\n/about - что я умею\n/ping - могу отбить мяч")
- 
- 
-@bot.message_handler(commands=['about'])
-def about(message):
- bot.reply_to(message, "Умный и простой в использовании бот, созданный для помощи в повседневных задачах. Автор бота — Анастасия.")
+    help_text = f"""
+Доступные команды:
+/note_add <текст> - Добавить заметку (максимум {MAX_NOTES_PER_USER})
+/note_list - Показать все заметки
+/note_find <запрос> - Найти заметку
+/note_edit <id> <новый текст> - Изменить заметку
+/note_del <id> - Удалить заметку
+/note_count - Количество заметок
+/note_export - Экспорт всех заметок в файл
+/note_stats - Статистика активности за неделю
+/models - Показать доступные модели
+/model <id> - Выбрать активную модель
+/ask <вопрос> - Задать вопрос ИИ
+/ask_model <ID> <вопрос> - Задать вопрос другой модели без смены активной
+/characters 
+/character <id>
+/whoami
+
+📝 Лимит: {MAX_NOTES_PER_USER} заметок на пользователя
+"""
+    bot.reply_to(message, help_text)
 
 
-@bot.message_handler(commands=['ping'])
-def ping(message):
-    bot.reply_to(message, "понг...")
-    
-    
-    
-@bot.message_handler(func=lambda m: m.text == "hide")
-def hide_kb(m):
-    rm = types.ReplyKeyboardRemove()
-    
-    bot.send_message(m.chat.id,"Спрятал клаву, хочешь покажу? /show", reply_markup=rm)  
-    
-@bot.message_handler(commands=['hide'])
-def hide_kb(m):
-    rm = types.ReplyKeyboardRemove()
-    
-    bot.send_message(m.chat.id,"Спрятал клаву", reply_markup=rm)  
-    
-#дз2
-@bot.message_handler(commands=['show'])
-def show_keyboard(message):
-    main_kb = make_main_kb()
-    bot.send_message(message.chat.id, "Показал клавиатуру:", reply_markup=main_kb)   
-    
-    
-    
-@bot.message_handler(commands=["confirm"])
-def confirm_cmd(m: types.Message) -> None:
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("Майонез", callback_data="confirm:M"),
-        types.InlineKeyboardButton("Кетчуп", callback_data="confirm:K"),
-        types.InlineKeyboardButton("Горчица", callback_data="confirm:G")
+@bot.message_handler(commands=['note_add'])
+def note_add(message):
+    # Проверяем лимит заметок
+    user_id = message.from_user.id
+    user_notes = list_notes(user_id)
+
+    if len(user_notes) >= MAX_NOTES_PER_USER:
+        bot.reply_to(
+            message,
+            f"❌ Достигнут лимит заметок! Максимум {MAX_NOTES_PER_USER} заметок на пользователя.\n"
+            f"У вас уже {len(user_notes)} заметок. Удалите некоторые заметки чтобы добавить новые."
+        )
+        return
+
+    text = message.text.replace('/note_add', '').strip()
+    if not text:
+        bot.reply_to(message, "Ошибка: Укажите текст заметки.")
+        return
+
+    note_id = add_note(user_id, text)
+    bot.reply_to(
+        message,
+        f"✅ Заметка #{note_id} добавлена: {text}\n"
+        f"📊 Статистика: {len(user_notes) + 1}/{MAX_NOTES_PER_USER} заметок"
     )
-    bot.send_message(m.chat.id, "Какой соус к пельменям ты любишь?", reply_markup=kb)
 
 
+@bot.message_handler(commands=['note_list'])
+def note_list(message):
+    user_id = message.from_user.id
+    user_notes = list_notes(user_id)
 
-@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("confirm:"))
-def on_confirm(c: types.CallbackQuery) -> None:
-    choice = c.data.split(":", 1)[1]
-    bot.answer_callback_query(c.id, "Все любят кушать!")
-    # Уберём inline-кнопки у исходного сообщения
-    bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
-    bot.send_message(c.message.chat.id, "Главное не сметана!" if choice == "M" else "Окей, ты странный!")
+    if not user_notes:
+        bot.reply_to(message, "Заметок пока нет.")
+        return
+
+    response = f"📝 Ваши заметки ({len(user_notes)}/{MAX_NOTES_PER_USER}):\n" + "\n".join(
+        [f"{note['id']}: {note['text']}" for note in user_notes])
+    bot.reply_to(message, response)
 
 
-@bot.message_handler(func=lambda m: m.text == "Сумма")
-def kb_sum(m: types.Message) -> None:
-    bot.send_message(m.chat.id, "Введите числа через пробел или запятую:")
-    bot.register_next_step_handler(m, on_sum_numbers)
-    logging.info(f"/sum от {m.from_user.first_name}{m.from_user.id}:{m.text}")
-def on_sum_numbers(m: types.Message) -> None:
-    nums = parse_ints_from_text(m.text)
-    #logging.info("KB-sum next step from id=%s text=%r -> %r", m.from_user.id if m.from_user else "?", m.text, nums)
-    if not nums:
-        bot.reply_to(m, "Не вижу чисел. Пример: 2 3 10")
+@bot.message_handler(commands=['note_find'])
+def note_find(message):
+    query = message.text.replace('/note_find', '').strip()
+    if not query:
+        bot.reply_to(message, "Ошибка: Укажите поисковый запрос.")
+        return
+
+    user_id = message.from_user.id
+    found_notes = find_notes(user_id, query)
+
+    if not found_notes:
+        bot.reply_to(message, "Заметки не найдены.")
+        return
+
+    response = f"🔍 Найденные заметки ({len(found_notes)}):\n" + "\n".join(
+        [f"{note['id']}: {note['text']}" for note in found_notes])
+    bot.reply_to(message, response)
+
+
+@bot.message_handler(commands=['note_edit'])
+def note_edit(message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Ошибка: Используйте /note_edit <id> <новый текст>")
+        return
+
+    try:
+        note_id = int(parts[1])
+        new_text = parts[2]
+    except ValueError:
+        bot.reply_to(message, "Ошибка: ID должен быть числом.")
+        return
+
+    user_id = message.from_user.id
+    success = update_note(user_id, note_id, new_text)
+
+    if not success:
+        bot.reply_to(message, f"Ошибка: Заметка #{note_id} не найдена или у вас нет прав для её изменения.")
+        return
+
+    user_notes = list_notes(user_id)
+    bot.reply_to(
+        message,
+        f"✏️ Заметка #{note_id} изменена на: {new_text}\n"
+        f"📊 Статистика: {len(user_notes)}/{MAX_NOTES_PER_USER} заметок"
+    )
+
+
+@bot.message_handler(commands=['note_del'])
+def note_del(message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Ошибка: Укажите ID заметки для удаления.")
+        return
+
+    try:
+        note_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Ошибка: ID должен быть числом.")
+        return
+
+    user_id = message.from_user.id
+    success = delete_note(user_id, note_id)
+
+    if not success:
+        bot.reply_to(message, f"Ошибка: Заметка #{note_id} не найдена или у вас нет прав для её удаления.")
+        return
+
+    user_notes = list_notes(user_id)
+    bot.reply_to(
+        message,
+        f"🗑️ Заметка #{note_id} удалена.\n"
+        f"📊 Статистика: {len(user_notes)}/{MAX_NOTES_PER_USER} заметок"
+    )
+
+
+@bot.message_handler(commands=['note_count'])
+def note_count(message):
+    user_id = message.from_user.id
+    user_notes = list_notes(user_id)
+    count = len(user_notes)
+
+    if count >= MAX_NOTES_PER_USER:
+        status = "❌ Лимит достигнут!"
+    elif count >= MAX_NOTES_PER_USER * 0.8:  # 80% от лимита
+        status = "⚠️ Лимит почти достигнут!"
     else:
-        bot.reply_to(m, f"Сумма: {sum(nums)}")
-        
-       
-   
-       
-       
-       
-       
-       
-       
-       
-     
-       
-       
-       
-#дз 2       
-@bot.message_handler(func=lambda m: m.text == "Max")
-def kb_max(m: types.Message) -> None:
-    bot.send_message(m.chat.id, "Введите числа через пробел или запятую:")
-    bot.register_next_step_handler(m, on_max_numbers)
-    
-def on_max_numbers(m: types.Message) -> None:
-    nums = parse_ints_from_text(m.text)
-    
-    if not nums:
-        bot.reply_to(m, "Не вижу чисел. Пример: 2 3 10")
+        status = "✅ Есть свободное место"
+
+    bot.reply_to(
+        message,
+        f"📊 Статистика заметок:\n"
+        f"• Всего заметок: {count}\n"
+        f"• Лимит: {MAX_NOTES_PER_USER}\n"
+        f"• Свободно: {MAX_NOTES_PER_USER - count}\n"
+        f"{status}"
+    )
+
+
+@bot.message_handler(commands=['note_export'])
+def note_export(message):
+    user_id = message.from_user.id
+    user_notes = list_notes(user_id)
+
+    if not user_notes:
+        bot.reply_to(message, "У вас нет заметок для экспорта.")
+        return
+
+    # Создаем имя файла с timestamp для уникальности
+    timestamp = int(time.time())
+    filename = f"notes_{user_id}_{timestamp}.txt"
+
+    try:
+        # Создаем содержимое файла
+        file_content = f"Ваши заметки (экспорт от {time.strftime('%Y-%m-%d %H:%M:%S')})\n"
+        file_content += f"Всего заметок: {len(user_notes)}/{MAX_NOTES_PER_USER}\n"
+        file_content += "=" * 50 + "\n\n"
+
+        for note in user_notes:
+            file_content += f"Заметка #{note['id']}:\n"
+            file_content += f"{note['text']}\n"
+            file_content += "-" * 30 + "\n"
+
+        # Записываем в файл
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(file_content)
+
+        # Отправляем файл пользователю
+        with open(filename, 'rb') as f:
+            bot.send_document(
+                message.chat.id,
+                f,
+                caption=f"📁 Ваши заметки ({len(user_notes)}/{MAX_NOTES_PER_USER} шт.)",
+                visible_file_name="your_notes.txt"
+            )
+
+        # Удаляем временный файл
+        os.remove(filename)
+
+    except Exception as e:
+        bot.reply_to(message, f"Ошибка при экспорте заметок: {str(e)}")
+        # Пытаемся удалить файл в случае ошибки
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except:
+                pass
+
+
+@bot.message_handler(commands=['note_stats'])
+def note_stats(message):
+    user_id = message.from_user.id
+    user_notes = list_notes(user_id)
+
+    if not user_notes:
+        bot.reply_to(message, "У вас пока нет заметок для статистики.")
+        return
+
+    # Получаем даты создания заметок (предполагаем, что в базе есть поле created_at)
+    # Если в вашей базе нет created_at, нужно будет адаптировать этот код
+    dates = []
+    for note in user_notes:
+        # Если в note есть created_at, используем его, иначе используем текущее время
+        if 'created_at' in note:
+            dates.append(note['created_at'])
+        else:
+            # Для демонстрации - случайные даты за последнюю неделю
+            days_ago = len(dates) % 7
+            dates.append(datetime.now() - timedelta(days=days_ago))
+
+    # Считаем активность по дням недели
+    week_activity = [0] * 7  # 0 = понедельник, 6 = воскресенье
+
+    for date in dates:
+        if isinstance(date, str):
+            # Если дата в строковом формате, преобразуем в datetime
+            try:
+                date_obj = datetime.fromisoformat(date.replace('Z', '+00:00'))
+            except:
+                date_obj = datetime.now()
+        else:
+            date_obj = date
+
+        weekday = date_obj.weekday()  # 0 = понедельник, 6 = воскресенье
+        week_activity[weekday] += 1
+
+    # Создаем ASCII гистограмму
+    max_activity = max(week_activity) if week_activity else 1
+    chart_height = 10
+
+    # Названия дней недели
+    days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    # Строим гистограмму
+    chart_lines = []
+
+    # Вертикальные столбцы (сверху вниз)
+    for level in range(chart_height, 0, -1):
+        line = ""
+        for day_activity in week_activity:
+            bar_height = (day_activity / max_activity) * chart_height if max_activity > 0 else 0
+            if bar_height >= level:
+                line += " ██ "
+            else:
+                line += "    "
+        chart_lines.append(line)
+
+    # Подписи дней и значения
+    days_line = ""
+    values_line = ""
+    for i, day in enumerate(days_ru):
+        days_line += f" {day} "
+        values_line += f" {week_activity[i]:2d}"
+
+    # Собираем всю визуализацию
+    stats_text = "📊 Ваша активность за неделю:\n\n"
+
+    # Добавляем гистограмму
+    for line in chart_lines:
+        stats_text += line + "\n"
+
+    stats_text += days_line + "\n"
+    stats_text += values_line + "\n\n"
+
+    # Общая статистика
+    total_notes = len(user_notes)
+    avg_per_day = total_notes / 7
+    most_active_day = days_ru[week_activity.index(max(week_activity))] if week_activity else "нет данных"
+
+    stats_text += f"📈 Общая статистика:\n"
+    stats_text += f"• Всего заметок: {total_notes}\n"
+    stats_text += f"• В среднем в день: {avg_per_day:.1f}\n"
+    stats_text += f"• Самый активный день: {most_active_day}\n"
+    stats_text += f"• Лимит использования: {total_notes}/{MAX_NOTES_PER_USER} ({total_notes / MAX_NOTES_PER_USER * 100:.1f}%)\n\n"
+
+    # Рекомендации
+    if max(week_activity) == 0:
+        stats_text += "💡 Совет: Попробуйте добавлять заметки регулярнее!"
+    elif max(week_activity) >= 5:
+        stats_text += "🔥 Отличная активность! Продолжайте в том же духе!"
     else:
-        bot.reply_to(m, f"Максимум: {max(nums)}")
-        
+        stats_text += "💪 Хорошая работа! Можно добавить еще немного заметок."
+
+    bot.reply_to(message, stats_text)
 
 
+@bot.message_handler(commands=["models"])
+def cmd_models(message: types.Message) -> None:
+    items = list_models()
+    if not items:
+        bot.reply_to(message, "Список моделей пуст")
+        return
+    lines = ["Доступные модели:"]
+    for m in items:
+        star = "*" if m["active"] else " "
+        lines.append(f"{star} {m['id']}. {m['label']} [{m['key']}]")
+    lines.append("\nАктивировать: /model <ID>")
+    bot.reply_to(message, "\n".join(lines))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s-%(levelname)s-%(message)s"
-)
+
+@bot.message_handler(commands=["model"])
+def cmd_model(message: types.Message) -> None:
+    arg = message.text.replace("/model", "", 1).strip()
+    if not arg:
+        active = get_active_model()
+        bot.reply_to(message,
+                     f"Текущая активная модель: {active['label']} [{active['key']}]\n(сменить: /model <ID> или /models)")
+        return
+    if not arg.isdigit():
+        bot.reply_to(message, "Использование: /model <ID из /models>")
+        return
+    try:
+        active = set_active_model(int(arg))
+        bot.reply_to(message, f"Активная модель переключена: {active['label']} [{active['key']}]")
+    except ValueError:
+        bot.reply_to(message, "Неизвестный ID модели. Сначала /models")
 
 
+def build_messages(user_id: int, user_text: str) -> list[dict]:
+    """Строит список сообщений для LLM с учетом персонажа пользователя"""
+    character = get_user_character(user_id)
+
+    # Формируем system-сообщение с именем и prompt персонажа + правила
+    system_content = f"Ты - {character['name']}. {character.get('prompt', '')}\n\n"
+    system_content += "Формат ответа:\n"
+    system_content += "1. Отвечай кратко и по существу\n"
+    system_content += "2. Технические ответы давай корректно и по пунктам\n"
+    system_content += "3. Будь полезным и информативным\n"
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_text},
+    ]
 
 
+def build_messages_for_character(character: dict, user_text: str) -> list[dict]:
+    """Строит список сообщений для LLM для конкретного персонажа"""
+    # Формируем system-сообщение с именем и prompt персонажа + правила
+    system_content = f"Ты - {character['name']}. {character.get('prompt', '')}\n\n"
+    system_content += "Правила ответа:\n"
+    system_content += "1. Отвечай кратко и по существу\n"
+    system_content += "2. Технические ответы давай корректно и по пунктам\n"
+    system_content += "3. Будь полезным и информативным\n"
 
-def make_main_kb()->types.ReplyKeyboardMarkup:
-    kb=types.ReplyKeyboardMarkup(resize_keyboard = True)
-    kb.row("/about","Сумма","Max")
-    kb.row("/help","Weather","hide")
-    return kb
-    
-        
-   
-    
-    
-    
-    
- 
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_text},
+    ]
+
+
+@bot.message_handler(commands=["ask"])
+def cmd_ask(message: types.Message) -> None:
+    q = message.text.replace("/ask", "", 1).strip()
+    if not q:
+        bot.reply_to(message, "Использование: /ask <вопрос>")
+        return
+
+    msgs = build_messages(message.from_user.id, q[:600])
+    model_key = get_active_model()["key"]
+
+    try:
+        text, ms = chat_once(msgs, model=model_key, temperature=0.2, max_tokens=400)
+        out = (text or "").strip()[:4000]  # не переполняем сообщение Telegram
+        bot.reply_to(message, f"{out}\n\n({ms} мс; модель: {model_key})")
+    except OpenRouterError as e:
+        bot.reply_to(message, f"Ошибка: {e}")
+    except Exception:
+        bot.reply_to(message, "Непредвиденная ошибка.")
+
+
+@bot.message_handler(commands=["characters"])
+def cmd_characters(message: types.Message) -> None:
+    user_id = message.from_user.id
+    items = list_characters()
+    if not items:
+        bot.reply_to(message, "Каталог персонажей пуст.")
+        return
+
+    try:
+        current = get_user_character(user_id)["id"]
+    except Exception:
+        current = None
+
+    lines = ["Доступные персонажи:"]
+    for p in items:
+        star = "*" if current is not None and p["id"] == current else " "
+        lines.append(f"{star} {p['id']}. {p['name']}")
+    lines.append("\nВыбор: /character <ID>")
+    bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=["character"])
+def cmd_character(message: types.Message) -> None:
+    user_id = message.from_user.id
+    arg = message.text.replace("/character", "", 1).strip()
+    if not arg:
+        p = get_user_character(user_id)
+        bot.reply_to(message, f"Текущий персонаж: {p['name']}\n(сменить: /characters, затем /character <ID>)")
+        return
+    if not arg.isdigit():
+        bot.reply_to(message, "Использование: /character <ID из /characters")
+        return
+    try:
+        p = set_user_character(user_id, int(arg))
+        bot.reply_to(message, f"Персонаж установлен: {p['name']}")
+    except ValueError:
+        bot.reply_to(message, "Неизвестный ID персонажа. Сначала /characters.")
+
+
+@bot.message_handler(commands=["whoami"])
+def cmd_whoami(message: types.Message) -> None:
+    character = get_user_character(message.from_user.id)
+    model = get_active_model()
+    bot.reply_to(message, f"Модель: {model['label']} [{model['key']}]\nПерсонаж: {character['name']}")
+
+
+@bot.message_handler(commands=["ask_random"])
+def cmd_ask_random(message: types.Message) -> None:
+    q = message.text.replace("/ask_random", "", 1).strip()
+    if not q:
+        bot.reply_to(message, "Использование: /ask_random <вопрос>")
+        return
+    q = q[:600]
+
+    items = list_characters()
+    if not items:
+        bot.reply_to(message, "Каталог персонажей пуст.")
+        return
+    chosen = random.choice(items)
+    character = get_character_by_id(chosen["id"])
+
+    msgs = build_messages_for_character(character, q)
+    model_key = get_active_model()["key"]
+
+    try:
+        text, ms = chat_once(msgs, model=model_key, temperature=0.2, max_tokens=400)
+        out = (text or "").strip()[:4000]
+        bot.reply_to(message, f"{out}\n\n({ms} мс; модель: {model_key}; как: {character['name']})")
+    except OpenRouterError as e:
+        bot.reply_to(message, f"Ошибка: {e}")
+    except Exception:
+        bot.reply_to(message, "Непредвиденная ошибка")
+
+
+@bot.message_handler(commands=["ask_model"])
+def cmd_ask_model(message: types.Message) -> None:
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Использование: /ask_model <ID модели> <вопрос>")
+        return
+
+    try:
+        model_id = int(parts[1])
+        question = parts[2].strip()
+    except ValueError:
+        bot.reply_to(message, "Ошибка: ID модели должен быть числом.")
+        return
+
+    if not question:
+        bot.reply_to(message, "Ошибка: Укажите вопрос.")
+        return
+
+    # Получаем модель по ID
+    try:
+        target_model = get_model_by_id(model_id)
+    except ValueError:
+        bot.reply_to(message, f"Ошибка: Модель с ID={model_id} не найдена. Сначала /models")
+        return
+
+    # Строим сообщения с текущим персонажем пользователя
+    msgs = build_messages(message.from_user.id, question[:600])
+
+    try:
+        # Выполняем запрос к указанной модели
+        text, ms = chat_once(msgs, model=target_model["key"], temperature=0.2, max_tokens=400)
+        out = (text or "").strip()[:4000]
+
+        # Получаем активную модель для информации
+        active_model = get_active_model()
+
+        bot.reply_to(
+            message,
+            f"{out}\n\n"
+            f"({ms} мс; модель: {target_model['label']} [{target_model['key']}])\n"
+            f"Активная модель осталась: {active_model['label']}"
+        )
+    except OpenRouterError as e:
+        bot.reply_to(message, f"Ошибка: {e}")
+    except Exception:
+        bot.reply_to(message, "Непредвиденная ошибка.")
+
+
 if __name__ == "__main__":
-    import time
-    while True:
-        try:
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception as e:
-            print("Ошибка polling")
-            time.sleep(5)
-
+    print("Бот запускается...")
+    bot.infinity_polling()
